@@ -54,13 +54,19 @@ def save_json(filepath: str, data: Any) -> bool:
         logger.error(f"❌ Failed to save {filepath}: {e}")
         return False
 
-def compute_file_hash(filepath: str) -> Optional[str]:
+def compute_file_hash(filepath: str, partial: bool = False, size: int = 64*1024) -> Optional[str]:
     """Compute SHA-256 hash of file. Returns None if fails."""
     try:
         hasher = hashlib.sha256()
+        file_size = os.path.getsize(filepath)
         with open(filepath, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hasher.update(chunk)
+            if partial and file_size > size * 2:
+                hasher.update(f.read(size))
+                f.seek(-size, os.SEEK_END)
+                hasher.update(f.read(size))
+            else:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hasher.update(chunk)
         return hasher.hexdigest()
     except Exception as e:
         logger.warning(f"⚠️ Could not hash {filepath}: {e}")
@@ -124,9 +130,10 @@ class AutoFixer:
 # ========================
 
 class BackupEngine:
-    def __init__(self, source_dir: str, target_dir: str, resume: bool = True):
+    def __init__(self, source_dir: str, target_dir: str, resume: bool = True, dry_run: bool = False):
         self.source_dir = Path(source_dir).resolve()
         self.target_dir = Path(target_dir).resolve()
+        self.dry_run = dry_run
         self.state = self.load_state(resume)
         self.stats = {"copied": 0, "skipped": 0, "failed": 0, "fixed": 0}
 
@@ -162,6 +169,29 @@ class BackupEngine:
         if not target_file.exists():
             return True
 
+        # Fast check: compare size and mtime
+        src_stat = src_file.stat()
+        target_stat = target_file.stat()
+        if src_stat.st_size != target_stat.st_size:
+            return True
+        if src_stat.st_mtime != target_stat.st_mtime:
+            return True
+
+        if src_stat.st_size > 10 * 1024 * 1024:
+            src_partial = compute_file_hash(str(src_file), partial=True)
+            if src_partial is None:
+                AutoFixer.skip_and_log_corrupt_file(str(src_file), "unreadable source")
+                self.stats["failed"] += 1
+                return False
+
+            target_partial = compute_file_hash(str(target_file), partial=True)
+            if target_partial is None:
+                logger.warning(f"⚠️ Target file corrupt: {target_file}. Will overwrite.")
+                return True
+
+            if src_partial != target_partial:
+                return True
+
         src_hash = compute_file_hash(str(src_file))
         if src_hash is None:
             AutoFixer.skip_and_log_corrupt_file(str(src_file), "unreadable source")
@@ -180,12 +210,13 @@ class BackupEngine:
         for attempt in range(1, max_retries + 1):
             try:
                 # Ensure target directory exists
-                if not AutoFixer.fix_directory(str(dst.parent)):
+                if not self.dry_run and not AutoFixer.fix_directory(str(dst.parent)):
                     self.stats["failed"] += 1
                     return False
 
                 # Try copying
-                shutil.copy2(src, dst)
+                if not self.dry_run:
+                    shutil.copy2(src, dst)
                 logger.info(f"✅ Copied: {src} -> {dst}")
                 self.stats["copied"] += 1
                 return True
@@ -282,13 +313,14 @@ def main():
     parser.add_argument("target", help="Target backup directory")
     parser.add_argument("--fresh", action="store_true", help="Start fresh (ignore previous state)")
     parser.add_argument("--quiet", action="store_true", help="Suppress console output")
+    parser.add_argument("--dry-run", action="store_true", help="Perform a trial run with no changes made")
 
     args = parser.parse_args()
 
     if args.quiet:
         logger.handlers = [h for h in logger.handlers if not isinstance(h, logging.StreamHandler)]
 
-    engine = BackupEngine(args.source, args.target, resume=not args.fresh)
+    engine = BackupEngine(args.source, args.target, resume=not args.fresh, dry_run=args.dry_run)
     success = engine.run()
 
     sys.exit(0 if success else 1)

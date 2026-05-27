@@ -22,17 +22,21 @@ def compute_file_hash(filepath: Path, partial: bool = False, size: int = 64*1024
 
 def should_copy_file(src: Path, dst: Path) -> bool:
     if not dst.exists(): return True
-    if src.stat().st_size != dst.stat().st_size: return True
-    if src.stat().st_mtime != dst.stat().st_mtime: return True
+
+    src_stat = src.stat()
+    dst_stat = dst.stat()
+
+    if src_stat.st_size != dst_stat.st_size: return True
+    if src_stat.st_mtime != dst_stat.st_mtime: return True
     
     # Partial hash for large files (>10MB)
-    if src.stat().st_size > 10 * 1024 * 1024:
+    if src_stat.st_size > 10 * 1024 * 1024:
         if compute_file_hash(src, partial=True) != compute_file_hash(dst, partial=True):
             return True
             
     return compute_file_hash(src) != compute_file_hash(dst)
 
-def process_single_file(src: Path, dst_root: Path, source_root: Path, stats: 'Stats'):
+def process_single_file(src: Path, dst_root: Path, source_root: Path, stats: 'Stats', dry_run: bool = False):
     try:
         rel_path = src.relative_to(source_root)
         dst = dst_root / rel_path
@@ -41,8 +45,9 @@ def process_single_file(src: Path, dst_root: Path, source_root: Path, stats: 'St
             stats.increment("skipped")
             return
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        if not dry_run:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
         stats.increment("copied")
     except Exception as e:
         logging.getLogger("deltaguard").error(f"Failed {src}: {e}")
@@ -75,7 +80,7 @@ from rich.console import Console
 from concurrent.futures import ThreadPoolExecutor
 import argparse
 
-def run_backup(source: Path, target: Path) -> 'Stats':
+def run_backup(source: Path, target: Path, workers: int = 8, dry_run: bool = False) -> 'Stats':
     files = discover_files(source)
     stats = Stats()
     stats._stats["discovered"] = len(files)
@@ -89,8 +94,8 @@ def run_backup(source: Path, target: Path) -> 'Stats':
     ) as progress:
         main_task = progress.add_task("[green]Backing up files...", total=len(files))
         
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(process_single_file, f, target, source, stats) for f in files]
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(process_single_file, f, target, source, stats, dry_run) for f in files]
             for future in futures:
                 future.add_done_callback(lambda _: progress.advance(main_task))
                 
@@ -123,6 +128,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deltaguard: Fast Concurrent File Backup")
     parser.add_argument("source", type=Path, help="Source directory")
     parser.add_argument("target", type=Path, help="Target directory")
+    parser.add_argument("--workers", type=int, default=8, help="Number of worker threads")
+    parser.add_argument("--dry-run", action="store_true", help="Perform a trial run with no changes made")
     
     args = parser.parse_args()
     
@@ -130,5 +137,5 @@ if __name__ == "__main__":
         logger.error(f"Source directory does not exist: {args.source}")
         exit(1)
         
-    stats = run_backup(args.source, args.target)
+    stats = run_backup(args.source, args.target, args.workers, args.dry_run)
     print_report(stats)

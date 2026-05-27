@@ -154,12 +154,13 @@ class AutoFixer:
 # ========================
 
 class BackupEngine:
-    def __init__(self, source_dir: str, target_dir: str, resume: bool = True, config: Dict[str, Any] = None):
+    def __init__(self, source_dir: str, target_dir: str, resume: bool = True, config: Dict[str, Any] = None, dry_run: bool = False):
         self.source_dir = Path(source_dir).resolve()
         self.target_dir = Path(target_dir).resolve()
         self.config = config or DEFAULT_CONFIG
         self.state = self.load_state(resume)
         self.stats = {"copied": 0, "skipped": 0, "failed": 0, "fixed": 0}
+        self.dry_run = dry_run
         self.file_cache = {}  # Cache for file metadata to avoid repeated stat calls
 
     def load_state(self, resume: bool) -> Dict[str, Any]:
@@ -284,17 +285,19 @@ class BackupEngine:
         for attempt in range(1, max_retries + 1):
             try:
                 # Ensure target directory exists
-                if not AutoFixer.fix_directory(str(dst.parent)):
+                if not self.dry_run and not AutoFixer.fix_directory(str(dst.parent)):
                     self.stats["failed"] += 1
                     return False
 
                 # Try copying
-                shutil.copy2(src, dst)
+                if not self.dry_run:
+                    shutil.copy2(src, dst)
                 logger.info(f"✅ Copied: {src} -> {dst}")
                 self.stats["copied"] += 1
                 
                 # Update file cache for the new file
-                self.file_cache[str(dst)] = self.get_file_metadata(dst)
+                if not self.dry_run:
+                    self.file_cache[str(dst)] = self.get_file_metadata(dst)
                 return True
 
             except PermissionError:
@@ -399,6 +402,7 @@ def main():
     parser.add_argument("--fresh", action="store_true", help="Start fresh (ignore previous state)")
     parser.add_argument("--quiet", action="store_true", help="Suppress console output")
     parser.add_argument("--config", help="Path to configuration file")
+    parser.add_argument("--dry-run", action="store_true", help="Perform a trial run with no changes made")
     
     args = parser.parse_args()
 
@@ -415,7 +419,7 @@ def main():
     if args.quiet:
         logger.handlers = [h for h in logger.handlers if not isinstance(h, logging.StreamHandler)]
 
-    engine = BackupEngine(args.source, args.target, resume=not args.fresh, config=config)
+    engine = BackupEngine(args.source, args.target, resume=not args.fresh, config=config, dry_run=args.dry_run)
     success = engine.run()
 
     sys.exit(0 if success else 1)
